@@ -9,6 +9,7 @@ use crate::DocumentId;
 use automerge::ChangeHash;
 pub use error::Error;
 use error::ErrorKind;
+use std::str::FromStr;
 
 /// A database that stores documents in the filesystem
 ///
@@ -290,7 +291,9 @@ struct DocIdPaths {
 
 impl<'a> From<&'a DocumentId> for DocIdPaths {
     fn from(doc_id: &'a DocumentId) -> Self {
-        let hash = ring::digest::digest(&ring::digest::SHA256, doc_id.as_ref())
+        // pretty icky expect here
+        let uuid = uuid::Uuid::from_bytes(doc_id.as_ref().try_into().expect("valid uuid"));
+        let hash = ring::digest::digest(&ring::digest::SHA256, uuid.to_string().as_ref())
             .as_ref()
             .to_vec();
         let mut prefix = [0u8; 2];
@@ -310,14 +313,18 @@ impl DocIdPaths {
         let prefix = hex::decode(level1).ok()?;
         let prefix = <[u8; 2]>::try_from(prefix).ok()?;
 
+        // This is a deviation from main to support our old filesystem structure
+        // We should evaluate this around automerge3 time.
         let level2 = level2.file_name()?.to_str()?;
         let doc_id_bytes = hex::decode(level2).ok()?;
-        let Ok(doc_id) = DocumentId::try_from(doc_id_bytes) else {
+        let doc_id_str = String::from_utf8(doc_id_bytes).ok()?;
+        let Ok(doc_id) = DocumentId::from_str(&doc_id_str) else {
             tracing::error!(level2_path=%level2, "invalid document ID");
             return None;
         };
         let result = Self::from(&doc_id);
         if result.prefix != prefix {
+            tracing::warn!(?prefix, expected_prefix=?result.prefix, "Prefixes do not match");
             None
         } else {
             Some(result)
@@ -336,7 +343,8 @@ impl DocIdPaths {
     ///     `<root>/<first two bytes of SHA256 hash of document ID>/<hex encoded bytes of document ID>`
     fn level2_path<P: AsRef<Path>>(&self, root: P) -> std::path::PathBuf {
         let mut path = self.level1_path(root);
-        path.push(hex::encode(self.doc_id.as_ref()));
+        let uuid_str = self.doc_id.as_uuid_str();
+        path.push(hex::encode::<String>(uuid_str));
         path
     }
 
@@ -594,5 +602,26 @@ mod tests {
             reloaded.get(&automerge::ROOT, "foo").unwrap().unwrap().0,
             "baz".into()
         );
+    }
+
+    use super::*;   
+    use tempfile::TempDir;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_fs_store() {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let store = FsStore::open(temp_dir.path()).expect("Failed to open FsStore");
+        
+        // Take a document ID
+        let uuid_str = "84735747-4ea1-4001-b753-48e6825e53c2";
+        let doc_id = DocumentId::from_str(uuid_str).expect("valid");
+
+        // Print the paths
+        let paths = DocIdPaths::from(&doc_id);
+        println!("Level 1 Path: {}", paths.level1_path(&store.root).display());
+        println!("Level 2 Path: {}", paths.level2_path(&store.root).display());
+
+        // /var/lib/bowtie/data/5a9a/38343733353734372d346561312d343030312d623735332d343865363832356535336332
     }
 }
